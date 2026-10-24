@@ -12,7 +12,7 @@ Creates and runs a **Minecraft Bedrock** server (PocketMine-MP) on Termux with a
 # Termux (F-Droid or GitHub build — not the Play Store version)
 termux-setup-storage            # accept; PMMP's PHP reads DNS config from /sdcard/resolv.conf
 pkg install -y git
-git clone https://github.com/DevMiguel-max/pocketmine-termux.git && cd https://github.com/DevMiguel-max/pocketmine-termux.git
+git clone https://github.com/DevMiguel-max/pocketmine-termux.git && cd pocketmine-termux
 bash install.sh                 # installs deps, downloads PHP + phar (+ playit) and starts
 ```
 

@@ -12,7 +12,7 @@ Cria e roda um servidor **Minecraft Bedrock** (PocketMine-MP) no Termux com um c
 # Termux (F-Droid ou GitHub — não use a versão da Play Store)
 termux-setup-storage            # aceite; o PHP da PMMP lê DNS de /sdcard/resolv.conf
 pkg install -y git
-git clone <seu-repo> && cd <seu-repo>
+git clone https://github.com/DevMiguel-max/pocketmine-termux.git && cd https://github.com/DevMiguel-max/pocketmine-termux.git
 bash install.sh                 # instala deps, baixa PHP + phar (+ playit) e inicia
 ```
 

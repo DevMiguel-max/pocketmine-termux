@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+# pmmp — instala e controla um servidor PocketMine-MP (Minecraft Bedrock) no Termux.
+# Uso: ./pmmp help
+set -uo pipefail
+
+ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVER_DIR="$ROOT/server"
+PLAYIT_DIR="$ROOT/playit"
+BACKUP_DIR="$ROOT/backups"
+SESSION="pmmp"
+PLAYIT_SESSION="pmmp-playit"
+
+# ---------- padrões (config.env sobrescreve) ----------
+PHP_VERSION="8.4"
+PM_VERSION="latest"
+SERVER_NAME="PocketMine Termux"
+SERVER_PORT="19132"
+MAX_PLAYERS="8"
+VIEW_DISTANCE="6"
+GAMEMODE="survival"
+DIFFICULTY="normal"
+XBOX_AUTH="on"
+ENABLE_IPV6="off"
+LANGUAGE="eng"
+AUTO_RESTART="1"
+USE_PLAYIT="1"
+PLAYIT_VERSION="v1.0.10"
+PLAYIT_WRAPPER="proot"
+BACKUP_KEEP="5"
+# shellcheck disable=SC1091
+[ -f "$ROOT/config.env" ] && . "$ROOT/config.env"
+
+PHP_BIN="$SERVER_DIR/bin/php7/bin/php"
+PHAR="$SERVER_DIR/PocketMine-MP.phar"
+PLAYIT_BIN="$PLAYIT_DIR/playit"
+PLAYIT_CLI="$PLAYIT_DIR/playit-cli"
+
+# ---------- util ----------
+if [ -t 1 ]; then
+  C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[36m'; C_0=$'\e[0m'
+else
+  C_R=""; C_G=""; C_Y=""; C_B=""; C_0=""
+fi
+log()  { printf '%s\n' "${C_B}[pmmp]${C_0} $*"; }
+ok()   { printf '%s\n' "${C_G}[ok]${C_0} $*"; }
+warn() { printf '%s\n' "${C_Y}[aviso]${C_0} $*" >&2; }
+die()  { printf '%s\n' "${C_R}[erro]${C_0} $*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "Falta '$1'. Rode ./install.sh (ou: pkg install $1)"; }
+
+require_arch() {
+  case "$(uname -m)" in
+    aarch64|arm64) ;;
+    *) die "Arquitetura $(uname -m) não suportada: a PMMP só publica PHP para Android arm64 (aarch64)." ;;
+  esac
+}
+
+dl() { # dl URL DESTINO
+  local url="$1" dest="$2" tmp="$2.part"
+  rm -f "$tmp"
+  log "baixando: $url"
+  if ! curl -fL --retry 5 --retry-delay 3 --connect-timeout 20 -o "$tmp" "$url"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$dest"
+}
+
+is_running()     { command -v tmux >/dev/null 2>&1 && tmux has-session -t "$SESSION" 2>/dev/null; }
+playit_running() { command -v tmux >/dev/null 2>&1 && tmux has-session -t "$PLAYIT_SESSION" 2>/dev/null; }
+
+wake_lock()   { if command -v termux-wake-lock   >/dev/null 2>&1; then termux-wake-lock;   fi; }
+wake_unlock() { if command -v termux-wake-unlock >/dev/null 2>&1; then termux-wake-unlock; fi; }
+
+lan_ip() {
+  ip -4 -o addr show 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | grep -v '^127\.' | head -n1
+}
+
+# ---------- instalação ----------
+install_php() {
+  local force="${1:-}" marker="$SERVER_DIR/.php-version"
+  if [ -x "$PHP_BIN" ] && [ "$force" != "force" ] && [ "$(cat "$marker" 2>/dev/null)" = "$PHP_VERSION" ]; then
+    ok "PHP $PHP_VERSION já instalado"
+    return 0
+  fi
+  local url="https://github.com/pmmp/PHP-Binaries/releases/download/pm5-php-${PHP_VERSION}-latest/PHP-${PHP_VERSION}-Android-arm64-PM5.tar.gz"
+  local tmp; tmp="$(mktemp -d)" || die "mktemp falhou"
+  if ! dl "$url" "$tmp/php.tar.gz"; then
+    rm -rf "$tmp"
+    die "Falha ao baixar o PHP $PHP_VERSION (versões do PM5: 8.2, 8.3, 8.4, 8.5). Cheque internet e config.env."
+  fi
+  tar -xzf "$tmp/php.tar.gz" -C "$tmp" || { rm -rf "$tmp"; die "Falha ao extrair o PHP"; }
+  [ -f "$tmp/bin/php7/bin/php" ] || { rm -rf "$tmp"; die "Pacote do PHP veio sem bin/php7/bin/php"; }
+  chmod +x "$tmp/bin/php7/bin/php"
+  rm -rf "${SERVER_DIR:?}/bin"
+  mv "$tmp/bin" "$SERVER_DIR/bin"
+  rm -rf "$tmp"
+  echo "$PHP_VERSION" > "$marker"
+  check_php || die "PHP instalado mas não funciona (veja ./pmmp doctor)"
+  ok "PHP $PHP_VERSION instalado"
+}
+
+check_php() {
+  [ -x "$PHP_BIN" ] || return 1
+  PHPRC="" "$PHP_BIN" -r 'exit(extension_loaded("pmmpthread") ? 0 : 1);' >/dev/null 2>&1
+}
+
+install_phar() {
+  local force="${1:-}"
+  if [ -f "$PHAR" ] && [ "$force" != "force" ]; then
+    ok "PocketMine-MP.phar já existe"
+    return 0
+  fi
+  local url
+  if [ "$PM_VERSION" = "latest" ]; then
+    url="https://github.com/pmmp/PocketMine-MP/releases/latest/download/PocketMine-MP.phar"
+  else
+    url="https://github.com/pmmp/PocketMine-MP/releases/download/${PM_VERSION}/PocketMine-MP.phar"
+  fi
+  if ! dl "$url" "$PHAR.new"; then
+    rm -f "$PHAR.new"
+    die "Falha ao baixar o PocketMine-MP.phar (PM_VERSION=$PM_VERSION)"
+  fi
+  local size; size="$(wc -c < "$PHAR.new")"
+  if [ "$size" -lt 1000000 ]; then
+    rm -f "$PHAR.new"
+    die "PocketMine-MP.phar baixado parece inválido ($size bytes)"
+  fi
+  [ -f "$PHAR" ] && mv -f "$PHAR" "$PHAR.bak"
+  mv -f "$PHAR.new" "$PHAR"
+  ok "PocketMine-MP.phar instalado ($size bytes)"
+}
+
+seed_properties() {
+  local f="$SERVER_DIR/server.properties"
+  if [ -f "$f" ]; then
+    ok "server.properties já existe (não sobrescrito)"
+    return 0
+  fi
+  cat > "$f" <<EOF
+motd=$SERVER_NAME
+server-port=$SERVER_PORT
+max-players=$MAX_PLAYERS
+view-distance=$VIEW_DISTANCE
+gamemode=$GAMEMODE
+difficulty=$DIFFICULTY
+xbox-auth=$XBOX_AUTH
+enable-ipv6=$ENABLE_IPV6
+language=$LANGUAGE
+EOF
+  ok "server.properties criado"
+}
+
+# O PHP da PMMP para Android é musl estático e lê DNS de /sdcard/resolv.conf (não de /etc).
+ensure_php_dns() {
+  if [ -f /sdcard/resolv.conf ]; then
+    return 0
+  fi
+  if [ -d /sdcard ] && [ -w /sdcard ]; then
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /sdcard/resolv.conf \
+      && ok "criado /sdcard/resolv.conf (DNS do PHP)"
+  else
+    warn "Sem acesso a /sdcard. Rode 'termux-setup-storage', aceite a permissão e depois './pmmp setup'."
+    warn "Sem isso o PHP não resolve DNS (checagem de update, plugins online). O servidor ainda sobe."
+  fi
+}
+
+cmd_setup() {
+  require_arch
+  need curl; need tar
+  mkdir -p "$SERVER_DIR" "$BACKUP_DIR"
+  install_php
+  install_phar
+  seed_properties
+  ensure_php_dns
+  if [ "$USE_PLAYIT" = "1" ]; then
+    playit_install || warn "playit não instalado (é opcional) — o servidor funciona sem ele."
+  fi
+  ok "Setup concluído. Inicie com: ./pmmp start"
+}
+
+# ---------- servidor ----------
+cmd_run() { # primeiro plano (usado dentro do tmux; também serve pra debugar: ./pmmp run)
+  [ -x "$PHP_BIN" ] && [ -f "$PHAR" ] || die "Servidor não instalado. Rode: ./pmmp setup"
+  cd "$SERVER_DIR" || exit 1
+  export PHPRC=""
+  # Android não tem /tmp; o PocketMine extrai o cache do phar no diretório temporário do PHP (respeita TMPDIR).
+  if [ -z "${TMPDIR:-}" ] || [ ! -d "$TMPDIR" ]; then
+    export TMPDIR="$SERVER_DIR/tmp"
+    mkdir -p "$TMPDIR"
+  fi
+  local fast=0 code t0 t1
+  while :; do
+    t0="$(date +%s)"
+    "$PHP_BIN" "$PHAR" --no-wizard
+    code=$?
+    t1="$(date +%s)"
+    echo
+    echo "[pmmp] servidor encerrou (código $code)"
+    [ "$code" -eq 0 ] && break
+    [ "$AUTO_RESTART" = "1" ] || break
+    if [ $((t1 - t0)) -lt 30 ]; then fast=$((fast + 1)); else fast=0; fi
+    if [ "$fast" -ge 3 ]; then
+      echo "[pmmp] 3 quedas seguidas em menos de 30s — desisti de reiniciar. Rode ./pmmp doctor e ./pmmp run pra ver o erro."
+      break
+    fi
+    echo "[pmmp] reiniciando em 5s (Ctrl+C cancela)..."
+    sleep 5
+  done
+}
+
+cmd_start() {
+  need tmux
+  [ -x "$PHP_BIN" ] && [ -f "$PHAR" ] || die "Servidor não instalado. Rode: ./pmmp setup"
+  if is_running; then
+    warn "Servidor já está rodando (./pmmp console)"
+  else
+    wake_lock
+    tmux new-session -d -s "$SESSION" -c "$SERVER_DIR" "bash '$ROOT/pmmp' run" || die "Falha ao abrir sessão tmux"
+    ok "Servidor iniciando na porta UDP $SERVER_PORT. Console: ./pmmp console (sair sem parar: Ctrl+B, depois D)"
+  fi
+  if [ "$USE_PLAYIT" = "1" ] && [ -s "$PLAYIT_DIR/secret" ]; then
+    cmd_playit_start || warn "playit não subiu (veja ./pmmp playit-logs)"
+  elif [ "$USE_PLAYIT" = "1" ]; then
+    log "playit ainda não vinculado — rode ./pmmp playit-setup quando quiser acesso pela internet."
+  fi
+}
+
+cmd_stop() {
+  if playit_running; then cmd_playit_stop; fi
+  if is_running; then
+    log "Parando servidor..."
+    tmux send-keys -t "$SESSION" -l -- "stop"
+    tmux send-keys -t "$SESSION" Enter
+    for _ in $(seq 1 40); do
+      is_running || break
+      sleep 1
+    done
+    if is_running; then
+      warn "Não parou em 40s, forçando."
+      tmux kill-session -t "$SESSION" 2>/dev/null
+    fi
+    ok "Servidor parado"
+  else
+    warn "Servidor não estava rodando"
+  fi
+  wake_unlock
+}
+
+cmd_status() {
+  if is_running; then ok "servidor: RODANDO (UDP $SERVER_PORT)"; else warn "servidor: parado"; fi
+  if playit_running; then ok "playit: rodando"; else log "playit: parado"; fi
+  local ip; ip="$(lan_ip)"
+  [ -n "$ip" ] && log "Rede local: $ip:$SERVER_PORT (Minecraft Bedrock > Servidores > Adicionar)"
+  return 0
+}
+
+cmd_console() {
+  need tmux
+  is_running || die "Servidor parado. Use ./pmmp start"
+  log "Para sair sem parar o servidor: Ctrl+B, depois D"
+  exec tmux attach -t "$SESSION"
+}
+
+cmd_logs() {
+  [ -f "$SERVER_DIR/server.log" ] || die "Ainda não existe server.log"
+  exec tail -n 100 -f "$SERVER_DIR/server.log"
+}
+
+cmd_cmd() {
+  [ $# -gt 0 ] || die "Uso: ./pmmp cmd <comando do servidor>   ex: ./pmmp cmd op Steve"
+  is_running || die "Servidor parado"
+  tmux send-keys -t "$SESSION" -l -- "$*"
+  tmux send-keys -t "$SESSION" Enter
+}
+
+cmd_backup() {
+  mkdir -p "$BACKUP_DIR"
+  if is_running; then
+    tmux send-keys -t "$SESSION" -l -- "save-all"
+    tmux send-keys -t "$SESSION" Enter
+    sleep 3
+  fi
+  local items=() f
+  for f in worlds players plugins plugin_data server.properties pocketmine.yml ops.txt white-list.txt banned-players.txt banned-ips.txt; do
+    [ -e "$SERVER_DIR/$f" ] && items+=("$f")
+  done
+  if [ "${#items[@]}" -eq 0 ]; then
+    warn "Nada para salvar ainda"
+    return 0
+  fi
+  local out; out="$BACKUP_DIR/pmmp-$(date +%Y%m%d-%H%M%S).tar.gz"
+  tar -czf "$out" -C "$SERVER_DIR" "${items[@]}" || { warn "Backup falhou"; return 1; }
+  ok "Backup: $out"
+  local n=0 old
+  while IFS= read -r old; do
+    n=$((n + 1))
+    [ "$n" -gt "$BACKUP_KEEP" ] && rm -f "$old"
+  done < <(ls -1t "$BACKUP_DIR"/pmmp-*.tar.gz 2>/dev/null)
+}
+
+cmd_update() {
+  local with_php=0 was=0
+  [ "${1:-}" = "--php" ] && with_php=1
+  if is_running; then was=1; cmd_stop; fi
+  cmd_backup
+  install_phar force
+  [ "$with_php" -eq 1 ] && install_php force
+  [ "$was" -eq 1 ] && cmd_start
+  return 0
+}
+
+# ---------- playit (túnel opcional p/ acesso pela internet) ----------
+# Binário musl estático lê /etc/resolv.conf, que não existe no Android: sobrepomos /etc do Termux via proot.
+playit_wrap() {
+  if [ "$PLAYIT_WRAPPER" = "proot" ] && command -v proot >/dev/null 2>&1 && [ -n "${PREFIX:-}" ]; then
+    proot -b "$PREFIX/etc:/etc" "$@"
+  else
+    "$@"
+  fi
+}
+
+playit_install() {
+  local force="${1:-}" arch base
+  mkdir -p "$PLAYIT_DIR"
+  if [ -x "$PLAYIT_BIN" ] && [ -x "$PLAYIT_CLI" ] && [ "$force" != "force" ]; then
+    ok "playit já instalado"
+    return 0
+  fi
+  case "$(uname -m)" in
+    aarch64|arm64) arch="aarch64" ;;
+    *) warn "playit: arquitetura $(uname -m) não suportada por este script"; return 1 ;;
+  esac
+  if [ "$PLAYIT_VERSION" = "latest" ]; then
+    base="https://github.com/playit-cloud/playit-agent/releases/latest/download"
+  else
+    base="https://github.com/playit-cloud/playit-agent/releases/download/$PLAYIT_VERSION"
+  fi
+  dl "$base/playit-linux-$arch" "$PLAYIT_BIN" || return 1
+  dl "$base/playit-cli-linux-$arch" "$PLAYIT_CLI" || return 1
+  chmod +x "$PLAYIT_BIN" "$PLAYIT_CLI"
+  ok "playit $PLAYIT_VERSION instalado"
+}
+
+cmd_playit_setup() {
+  playit_install || die "Não consegui baixar o playit"
+  if [ -s "$PLAYIT_DIR/secret" ]; then
+    ok "playit já vinculado à sua conta (apague playit/secret para refazer)"
+    return 0
+  fi
+  local code url secret
+  code="$(playit_wrap "$PLAYIT_CLI" claim generate 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+  [ -n "$code" ] || die "playit-cli claim generate não retornou código"
+  url="$(playit_wrap "$PLAYIT_CLI" claim url "$code" --name "pmmp-termux" --type self-managed 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+  [ -n "$url" ] || die "playit-cli claim url não retornou link"
+  echo
+  log "Abra este link, entre/crie sua conta playit e aprove o agente:"
+  echo "    $url"
+  echo
+  if command -v termux-open-url >/dev/null 2>&1; then termux-open-url "$url" >/dev/null 2>&1 || true; fi
+  log "Aguardando aprovação (Ctrl+C cancela)..."
+  secret="$(playit_wrap "$PLAYIT_CLI" claim exchange "$code" --wait 0 | tail -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  case "$secret" in
+    ""|*[!A-Za-z0-9_-]*) die "Não recebi um secret válido (recebido: '$secret'). Rode de novo." ;;
+  esac
+  if [ "${#secret}" -lt 16 ]; then die "Secret curto demais (${#secret} chars). Rode de novo."; fi
+  ( umask 077; printf '%s' "$secret" > "$PLAYIT_DIR/secret" )
+  ok "playit vinculado."
+  log "FALTA 1 passo manual: no painel playit.gg crie um túnel 'Minecraft Bedrock' apontando para 127.0.0.1:$SERVER_PORT."
+  log "Depois: ./pmmp restart  (o endereço público aparece em ./pmmp playit-status)"
+}
+
+cmd_playit_run() { # interno (roda dentro do tmux)
+  [ -s "$PLAYIT_DIR/secret" ] || die "playit sem secret: rode ./pmmp playit-setup"
+  cd "$PLAYIT_DIR" || exit 1
+  playit_wrap "$PLAYIT_BIN" --secret "$(cat "$PLAYIT_DIR/secret")" --socket-path "$PLAYIT_DIR/playit.sock"
+}
+
+cmd_playit_start() {
+  need tmux
+  [ -x "$PLAYIT_BIN" ] || die "playit não instalado: ./pmmp setup"
+  [ -s "$PLAYIT_DIR/secret" ] || die "playit não vinculado: ./pmmp playit-setup"
+  if playit_running; then warn "playit já está rodando"; return 0; fi
+  tmux new-session -d -s "$PLAYIT_SESSION" -c "$PLAYIT_DIR" "bash '$ROOT/pmmp' _playit_run" || return 1
+  ok "playit iniciado (logs: ./pmmp playit-logs)"
+}
+
+cmd_playit_stop() {
+  playit_running || { warn "playit não estava rodando"; return 0; }
+  tmux send-keys -t "$PLAYIT_SESSION" C-c
+  sleep 2
+  tmux kill-session -t "$PLAYIT_SESSION" 2>/dev/null
+  ok "playit parado"
+}
+
+cmd_playit_status() {
+  [ -x "$PLAYIT_CLI" ] || die "playit não instalado"
+  playit_running || die "playit não está rodando (./pmmp playit-start)"
+  playit_wrap "$PLAYIT_CLI" --socket-path "$PLAYIT_DIR/playit.sock" status
+}
+
+cmd_playit_logs() {
+  playit_running || die "playit não está rodando"
+  tmux capture-pane -p -t "$PLAYIT_SESSION" -S -200
+}
+
+# ---------- extras ----------
+cmd_boot() { # inicia o servidor no boot do celular (requer app Termux:Boot)
+  local d="$HOME/.termux/boot"
+  mkdir -p "$d"
+  cat > "$d/pmmp-start.sh" <<EOF
+#!/data/data/com.termux/files/usr/bin/sh
+termux-wake-lock
+bash "$ROOT/pmmp" start
+EOF
+  chmod +x "$d/pmmp-start.sh"
+  ok "Criado $d/pmmp-start.sh. Instale o app Termux:Boot (mesma fonte do Termux) e abra-o uma vez."
+}
+
+cmd_doctor() {
+  local bad=0
+  row() { # row OK|FALHA mensagem
+    if [ "$1" = "OK" ]; then printf '  %s[ok]%s    %s\n' "$C_G" "$C_0" "$2"; else printf '  %s[FALHA]%s %s\n' "$C_R" "$C_0" "$2"; bad=1; fi
+  }
+  echo "Diagnóstico:"
+  case "$(uname -m)" in aarch64|arm64) row OK "arquitetura $(uname -m)";; *) row FALHA "arquitetura $(uname -m) (precisa arm64)";; esac
+  for t in curl tar tmux; do
+    if command -v "$t" >/dev/null 2>&1; then row OK "$t instalado"; else row FALHA "$t ausente (pkg install $t)"; fi
+  done
+  if [ "$USE_PLAYIT" = "1" ]; then
+    if command -v proot >/dev/null 2>&1; then row OK "proot instalado (DNS do playit)"; else row FALHA "proot ausente (pkg install proot)"; fi
+  fi
+  if [ -x "$PHP_BIN" ]; then
+    local v; v="$(PHPRC="" "$PHP_BIN" -r 'echo PHP_VERSION;' 2>&1)"
+    if [ -n "$v" ] && [ "${v#*[!0-9.A-Za-z-]}" = "$v" ]; then row OK "PHP executa (versão $v)"; else row FALHA "PHP não executa: $v"; fi
+    if check_php; then row OK "extensão pmmpthread carregada"; else row FALHA "pmmpthread ausente no PHP"; fi
+    if PHPRC="" "$PHP_BIN" -r '$ip = gethostbyname("github.com"); exit($ip === "github.com" ? 1 : 0);' >/dev/null 2>&1; then
+      row OK "DNS do PHP funciona"
+    else
+      row FALHA "DNS do PHP falhou — crie /sdcard/resolv.conf (termux-setup-storage + ./pmmp setup)"
+    fi
+  else
+    row FALHA "PHP não instalado (./pmmp setup)"
+  fi
+  if [ -f "$PHAR" ]; then row OK "PocketMine-MP.phar presente"; else row FALHA "PocketMine-MP.phar ausente"; fi
+  if [ "$USE_PLAYIT" = "1" ]; then
+    if [ -x "$PLAYIT_BIN" ]; then row OK "playit instalado"; else row FALHA "playit não instalado"; fi
+    if [ -s "$PLAYIT_DIR/secret" ]; then row OK "playit vinculado"; else log "playit não vinculado (./pmmp playit-setup) — opcional"; fi
+  fi
+  if [ -f "$SERVER_DIR/server.log" ]; then
+    echo; echo "Últimas linhas de server.log:"; tail -n 15 "$SERVER_DIR/server.log"
+  fi
+  return "$bad"
+}
+
+usage() {
+  cat <<'EOF'
+pmmp — servidor PocketMine-MP (Minecraft Bedrock) no Termux
+
+  setup              baixa PHP (PMMP/Android), PocketMine-MP.phar e playit; cria server.properties
+  start | stop | restart | status
+  console            abre o console do servidor (sair: Ctrl+B, D)
+  logs               acompanha server/server.log
+  cmd <comando>      envia comando ao servidor (ex: ./pmmp cmd op Steve)
+  run                roda em primeiro plano (debug de erros de inicialização)
+  backup             compacta mundos/config em backups/ (mantém BACKUP_KEEP)
+  update [--php]     atualiza o phar (e o PHP com --php), com backup antes
+  doctor             diagnóstico do ambiente
+  playit-setup       vincula o playit à sua conta (gera link de aprovação)
+  playit-start | playit-stop | playit-status | playit-logs
+  boot               inicia no boot do celular (requer Termux:Boot)
+
+Config: edite config.env
+EOF
+}
+
+case "${1:-help}" in
+  setup)          cmd_setup ;;
+  start)          cmd_start ;;
+  stop)           cmd_stop ;;
+  restart)        cmd_stop; cmd_start ;;
+  status)         cmd_status ;;
+  console|attach) cmd_console ;;
+  logs)           cmd_logs ;;
+  cmd)            shift; cmd_cmd "$@" ;;
+  run|_run)       cmd_run ;;
+  backup)         cmd_backup ;;
+  update)         shift; cmd_update "${1:-}" ;;
+  doctor)         cmd_doctor ;;
+  playit-setup)   cmd_playit_setup ;;
+  playit-start)   cmd_playit_start ;;
+  playit-stop)    cmd_playit_stop ;;
+  playit-status)  cmd_playit_status ;;
+  playit-logs)    cmd_playit_logs ;;
+  _playit_run)    cmd_playit_run ;;
+  boot)           cmd_boot ;;
+  help|-h|--help) usage ;;
+  *)              usage; exit 1 ;;
+esac

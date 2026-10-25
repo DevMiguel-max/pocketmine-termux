@@ -8,13 +8,17 @@ Cria e roda um servidor **Minecraft Bedrock** (PocketMine-MP) no Termux com um c
 
 ## Uso rápido
 
+Use o Termux do F-Droid ou do GitHub (não o da Play Store). Rode os comandos **um de cada vez**:
+
 ```bash
-# Termux (F-Droid ou GitHub — não use a versão da Play Store)
-termux-setup-storage            # aceite; o PHP da PMMP lê DNS de /sdcard/resolv.conf
+termux-setup-storage
 pkg install -y git
-git clone https://github.com/DevMiguel-max/pocketmine-termux.git && cd pocketmine-termux
-bash install.sh                 # instala deps, baixa PHP + phar (+ playit) e inicia
+git clone https://github.com/DevMiguel-max/pocketmine-termux.git
+cd pocketmine-termux
+bash install.sh
 ```
+
+O `termux-setup-storage` precisa ser aceito (responda `y` e permita o acesso): o PHP da PMMP lê o DNS de `/sdcard/resolv.conf`. O `install.sh` faz um `pkg upgrade` completo, instala as dependências, baixa PHP + phar (+ playit) e inicia o servidor.
 
 Requisitos: Android **arm64** (aarch64), ~300 MB livres, internet na primeira execução.
 
@@ -29,7 +33,8 @@ Requisitos: Android **arm64** (aarch64), ~300 MB livres, internet na primeira ex
 | `./pmmp run` | primeiro plano, sem tmux — use pra ver erros de inicialização |
 | `./pmmp backup` | compacta mundos/config em `backups/` (mantém os 5 últimos) |
 | `./pmmp update [--php]` | atualiza o phar (e o PHP), com backup antes |
-| `./pmmp doctor` | diagnóstico (arch, PHP, pmmpthread, DNS, playit) |
+| `./pmmp status` | estado, IP local e versão do Minecraft do servidor |
+| `./pmmp doctor` | diagnóstico (arch, PHP, pmmpthread, DNS, status da conta playit) |
 | `./pmmp boot` | inicia junto com o celular (requer app Termux:Boot) |
 
 Se o arquivo perder o bit de execução ao colar no repo: `bash pmmp ...` funciona igual, ou `git update-index --chmod=+x pmmp install.sh`.
@@ -40,9 +45,12 @@ Configuração: `config.env` (versões, porta, jogadores, view-distance...). Os 
 
 - **Mesma rede Wi-Fi:** Minecraft Bedrock → Servidores → Adicionar → IP do celular (`./pmmp status` mostra), porta `19132`.
 - **Pela internet (playit, opcional):**
-  1. `./pmmp playit-setup` — mostra um link; abra, entre na conta playit e aprove.
-  2. No painel playit.gg, crie um túnel **Minecraft Bedrock** apontando para `127.0.0.1:19132`. *(Esse passo é manual; não há como automatizar pela CLI.)*
-  3. `./pmmp restart` — o endereço público aparece em `./pmmp playit-status`.
+  1. `./pmmp playit-setup` — mostra um link; abra, entre na conta playit e aprove o agente.
+  2. **Confirme o e-mail da conta playit.** Enquanto não confirmar, o agente loga `account_status="email_not_verified"` e o túnel não funciona (o `./pmmp doctor` avisa).
+  3. No painel playit.gg, crie um túnel **Minecraft Bedrock** com origem `127.0.0.1` porta `19132`. *(Manual; a CLI não faz isso.)*
+  4. `./pmmp restart`. O **endereço público fica na aba Overview do túnel, no site** — ele não aparece no terminal.
+
+  O painel pode avisar "Minecraft Bedrock requires RakNet" e sugerir `transport=raknet`. **Ignore**: isso vale para o servidor oficial da Mojang. O PocketMine-MP só fala RakNet, e essa propriedade não existe nele.
 
 ## Android: o que costuma derrubar o servidor
 
@@ -52,12 +60,26 @@ Configuração: `config.env` (versões, porta, jogadores, view-distance...). Os 
 - Desative a otimização de bateria do Termux.
 - `view-distance` alto + muitos jogadores esgotam RAM/CPU de celular. Comece com 6 e 8 jogadores.
 
+## Jogadores não conectam
+
+Teste nesta ordem; cada passo elimina uma causa.
+
+1. `./pmmp status` — servidor e playit rodando? Veja a **versão do servidor** que ele mostra: o Bedrock geralmente exige a mesma versão, então compare com a do seu jogo primeiro.
+2. Entre por **outro aparelho no mesmo Wi-Fi**, com o IP local e a porta `19132` (isolamento de clientes e rede de visitantes bloqueiam isso; não use o hotspot do próprio celular-servidor).
+3. Durante a tentativa, rode `./pmmp logs`: uma linha de login ou "Outdated" significa que o pacote chegou (problema de versão); nada aparecer significa que não chegou ao servidor (rede/IP).
+4. Só depois que o teste local funcionar, teste o endereço do playit. Acompanhe *Active Connections*/banda do túnel no site enquanto tenta.
+5. `./pmmp doctor` — confere o DNS do PHP (`/sdcard/resolv.conf`) e o status da conta playit.
+
+No log do playit, um único `Network unreachable` num endereço IPv6 e algumas linhas `SessionNotSetup` logo após conectar são normais. Um loop de `SessionNotSetup` que não para, não.
+
 ## Segurança
 
 `playit/secret` é a chave da sua conta de túnel. Já está no `.gitignore` junto com `server/` e `backups/` — não remova.
 
 ## O que foi testado (e o que não)
 
-Testado em ambiente aarch64 emulado: download dos binários, extração, `pmmpthread`/`leveldb` carregados, o phar sobe com `--no-wizard` até `Done` escutando em `0.0.0.0:19132`, geração de arquivos, start/stop/restart/cmd/backup, proteção contra crash-loop, fluxo de claim do playit (`claim generate`/`url` com o binário real).
+Em aarch64 emulado: download dos binários, extração, `pmmpthread`/`leveldb` carregados, o phar sobe com `--no-wizard` até `Done` em `0.0.0.0:19132`, start/stop/restart/cmd/backup, proteção contra crash-loop, fluxo de claim do playit.
 
-**Não testado em celular real:** DNS do playit via `proot -b $PREFIX/etc:/etc` (se não conectar, tente `PLAYIT_WRAPPER="none"` no `config.env` ou me mande o `./pmmp playit-logs`); formato exato da saída de `playit-cli claim exchange` (o script valida e aborta com mensagem se vier algo estranho); o console interativo dentro do tmux.
+Em celular real (confirmado pelo autor): instalação (depois de um upgrade completo do `apt`), servidor iniciando, daemon do playit rodando via `proot`, conectando e com o túnel carregado.
+
+**Ainda não confirmado:** um jogador de fato entrando, localmente ou pelo playit. O `playit-attach` e o `playit-login` foram adicionados sem terem sido executados.

@@ -20,16 +20,32 @@ case "$(uname -m)" in
 esac
 
 if command -v pkg >/dev/null 2>&1; then
-  echo "[install] Atualizando pacotes do Termux..."
+  echo "[install] Atualizando o Termux (upgrade completo, evita bibliotecas quebradas)..."
   export DEBIAN_FRONTEND=noninteractive
-  pkg update -y || echo "[aviso] pkg update falhou; tentando seguir"
+  # apt direto (o 'pkg' usa curl, que pode estar quebrado justamente por falta de upgrade)
+  if ! { apt-get update && apt-get -y -o Dpkg::Options::=--force-confnew full-upgrade; }; then
+    echo "[erro] upgrade falhou. Rode 'termux-change-repo', escolha outro mirror e tente de novo."
+    exit 1
+  fi
   echo "[install] Instalando dependências..."
   pkg install -y curl tar tmux proot ca-certificates
+  if ! curl --version >/dev/null 2>&1; then
+    echo "[erro] curl quebrado (libs desatualizadas). Rode: pkg upgrade -y   e depois: bash install.sh"
+    exit 1
+  fi
 else
   echo "[aviso] 'pkg' não encontrado (fora do Termux?). Garanta manualmente: curl tar tmux proot."
 fi
 
-if [ ! -d /sdcard ] || [ ! -w /sdcard ]; then
+if [ ! -w /sdcard ] && command -v termux-setup-storage >/dev/null 2>&1; then
+  echo "[install] Pedindo acesso ao armazenamento: aceite a permissão que vai aparecer na tela..."
+  termux-setup-storage || true
+  for _ in $(seq 1 30); do
+    [ -w /sdcard ] && break
+    sleep 2
+  done
+fi
+if [ ! -w /sdcard ]; then
   echo "[aviso] Sem acesso ao armazenamento. Rode 'termux-setup-storage', aceite, e depois ./pmmp setup"
   echo "        (o PHP da PMMP precisa de /sdcard/resolv.conf pra resolver DNS)."
 fi

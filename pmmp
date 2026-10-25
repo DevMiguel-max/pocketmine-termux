@@ -46,7 +46,12 @@ ok()   { printf '%s\n' "${C_G}[ok]${C_0} $*"; }
 warn() { printf '%s\n' "${C_Y}[aviso]${C_0} $*" >&2; }
 die()  { printf '%s\n' "${C_R}[erro]${C_0} $*" >&2; exit 1; }
 
-need() { command -v "$1" >/dev/null 2>&1 || die "Falta '$1'. Rode ./install.sh (ou: pkg install $1)"; }
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "Falta '$1'. Rode ./install.sh (ou: pkg install $1)"
+  if [ "$1" = "curl" ] && ! curl --version >/dev/null 2>&1; then
+    die "curl está quebrado (bibliotecas desatualizadas). Rode: apt update && apt full-upgrade -y"
+  fi
+}
 
 require_arch() {
   case "$(uname -m)" in
@@ -72,8 +77,18 @@ playit_running() { command -v tmux >/dev/null 2>&1 && tmux has-session -t "$PLAY
 wake_lock()   { if command -v termux-wake-lock   >/dev/null 2>&1; then termux-wake-lock;   fi; }
 wake_unlock() { if command -v termux-wake-unlock >/dev/null 2>&1; then termux-wake-unlock; fi; }
 
-lan_ip() {
-  ip -4 -o addr show 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | grep -v '^127\.' | head -n1
+lan_ip() { # IP local da rota padrão. 'ip' costuma ser bloqueado no Android, então o PHP vem primeiro.
+  local ip=""
+  if [ -x "$PHP_BIN" ]; then
+    ip="$(PHPRC="" "$PHP_BIN" -r '$s=@stream_socket_client("udp://8.8.8.8:53",$e,$m,2); if($s){$n=stream_socket_get_name($s,false); echo substr($n,0,strrpos($n,":"));}' 2>/dev/null)"
+  fi
+  if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 -o addr show 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | grep -v '^127\.' | head -n1)"
+  fi
+  if [ -z "$ip" ] && command -v ifconfig >/dev/null 2>&1; then
+    ip="$(ifconfig 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -n1)"
+  fi
+  printf '%s' "$ip"
 }
 
 # ---------- instalação ----------
@@ -250,8 +265,16 @@ cmd_stop() {
 cmd_status() {
   if is_running; then ok "servidor: RODANDO (UDP $SERVER_PORT)"; else warn "servidor: parado"; fi
   if playit_running; then ok "playit: rodando"; else log "playit: parado"; fi
-  local ip; ip="$(lan_ip)"
-  [ -n "$ip" ] && log "Rede local: $ip:$SERVER_PORT (Minecraft Bedrock > Servidores > Adicionar)"
+  local ip ver
+  ip="$(lan_ip)"
+  if [ -n "$ip" ]; then
+    log "IP local: $ip porta $SERVER_PORT (Minecraft > Servidores > Adicionar; os dois aparelhos no mesmo Wi-Fi)"
+  else
+    warn "Não consegui descobrir o IP (veja em Configurações > Wi-Fi > sua rede > Endereço IP)"
+  fi
+  ver="$(grep -h -o 'Bedrock Edition server version.*' "$SERVER_DIR/server.log" 2>/dev/null | tail -n1)"
+  [ -n "$ver" ] && log "Versão do servidor: ${ver#Bedrock Edition server version } (compare com a versão do seu Minecraft)"
+  if playit_running; then log "Endereço público do playit: veja no site playit.gg > seu túnel > Overview"; fi
   return 0
 }
 
@@ -366,8 +389,10 @@ cmd_playit_setup() {
   if [ "${#secret}" -lt 16 ]; then die "Secret curto demais (${#secret} chars). Rode de novo."; fi
   ( umask 077; printf '%s' "$secret" > "$PLAYIT_DIR/secret" )
   ok "playit vinculado."
-  log "FALTA 1 passo manual: no painel playit.gg crie um túnel 'Minecraft Bedrock' apontando para 127.0.0.1:$SERVER_PORT."
-  log "Depois: ./pmmp restart  (o endereço público aparece em ./pmmp playit-status)"
+  log "Faltam 2 passos manuais no site playit.gg:"
+  log "  1) confirme o e-mail da conta (sem isso o túnel não funciona: account_status=email_not_verified)"
+  log "  2) crie um túnel 'Minecraft Bedrock' com origem 127.0.0.1:$SERVER_PORT"
+  log "Depois: ./pmmp restart. O endereço público fica na aba Overview do túnel (não aparece no terminal)."
 }
 
 cmd_playit_run() { # interno (roda dentro do tmux)
@@ -401,7 +426,19 @@ cmd_playit_status() {
 
 cmd_playit_logs() {
   playit_running || die "playit não está rodando"
-  tmux capture-pane -p -t "$PLAYIT_SESSION" -S -200
+  tmux capture-pane -p -J -t "$PLAYIT_SESSION" -S -200 | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}'
+}
+
+cmd_playit_attach() { # interface interativa do playit (não verificada: pode ou não listar o endereço)
+  [ -x "$PLAYIT_CLI" ] || die "playit não instalado"
+  playit_running || die "playit não está rodando (./pmmp playit-start)"
+  playit_wrap "$PLAYIT_CLI" --socket-path "$PLAYIT_DIR/playit.sock" attach
+}
+
+cmd_playit_login() { # gera um link para entrar no painel (não verificado)
+  [ -x "$PLAYIT_CLI" ] || die "playit não instalado"
+  playit_running || die "playit não está rodando (./pmmp playit-start)"
+  playit_wrap "$PLAYIT_CLI" --socket-path "$PLAYIT_DIR/playit.sock" account login-url
 }
 
 # ---------- extras ----------
@@ -446,7 +483,19 @@ cmd_doctor() {
   if [ "$USE_PLAYIT" = "1" ]; then
     if [ -x "$PLAYIT_BIN" ]; then row OK "playit instalado"; else row FALHA "playit não instalado"; fi
     if [ -s "$PLAYIT_DIR/secret" ]; then row OK "playit vinculado"; else log "playit não vinculado (./pmmp playit-setup) — opcional"; fi
+    if playit_running; then
+      local st
+      st="$(tmux capture-pane -p -J -t "$PLAYIT_SESSION" -S -300 2>/dev/null | grep -o 'account_status="[a-z_]*"' | tail -n1)"
+      case "$st" in
+        'account_status="verified"') row OK "conta playit verificada" ;;
+        "") log "playit: sem status de conta nos logs ainda (espere 20s e rode de novo)" ;;
+        *) row FALHA "conta playit: $st. Confirme o e-mail em playit.gg e rode: ./pmmp playit-stop && ./pmmp playit-start" ;;
+      esac
+    fi
   fi
+  local ver
+  ver="$(grep -h -o 'Bedrock Edition server version.*' "$SERVER_DIR/server.log" 2>/dev/null | tail -n1)"
+  [ -n "$ver" ] && log "Versão do servidor: ${ver#Bedrock Edition server version } (seu Minecraft precisa ser compatível)"
   if [ -f "$SERVER_DIR/server.log" ]; then
     echo; echo "Últimas linhas de server.log:"; tail -n 15 "$SERVER_DIR/server.log"
   fi
@@ -468,6 +517,7 @@ pmmp — servidor PocketMine-MP (Minecraft Bedrock) no Termux
   doctor             diagnóstico do ambiente
   playit-setup       vincula o playit à sua conta (gera link de aprovação)
   playit-start | playit-stop | playit-status | playit-logs
+  playit-attach | playit-login   interface/link do playit (não verificados)
   boot               inicia no boot do celular (requer Termux:Boot)
 
 Config: edite config.env
@@ -492,6 +542,8 @@ case "${1:-help}" in
   playit-stop)    cmd_playit_stop ;;
   playit-status)  cmd_playit_status ;;
   playit-logs)    cmd_playit_logs ;;
+  playit-attach)  cmd_playit_attach ;;
+  playit-login)   cmd_playit_login ;;
   _playit_run)    cmd_playit_run ;;
   boot)           cmd_boot ;;
   help|-h|--help) usage ;;

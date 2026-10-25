@@ -12,6 +12,7 @@ PLAYIT_SESSION="pmmp-playit"
 
 # ---------- padrões (config.env sobrescreve) ----------
 PHP_VERSION="8.4"
+PM_REPO="BetterLite/PocketMine-MP"
 PM_VERSION="latest"
 SERVER_NAME="PocketMine Termux"
 SERVER_PORT="19132"
@@ -128,13 +129,14 @@ install_phar() {
   fi
   local url
   if [ "$PM_VERSION" = "latest" ]; then
-    url="https://github.com/pmmp/PocketMine-MP/releases/latest/download/PocketMine-MP.phar"
+    url="https://github.com/${PM_REPO}/releases/latest/download/PocketMine-MP.phar"
   else
-    url="https://github.com/pmmp/PocketMine-MP/releases/download/${PM_VERSION}/PocketMine-MP.phar"
+    url="https://github.com/${PM_REPO}/releases/download/${PM_VERSION}/PocketMine-MP.phar"
   fi
+  log "origem do phar: github.com/${PM_REPO}"
   if ! dl "$url" "$PHAR.new"; then
     rm -f "$PHAR.new"
-    die "Falha ao baixar o PocketMine-MP.phar (PM_VERSION=$PM_VERSION)"
+    die "Falha ao baixar o PocketMine-MP.phar (PM_REPO=$PM_REPO PM_VERSION=$PM_VERSION)"
   fi
   local size; size="$(wc -c < "$PHAR.new")"
   if [ "$size" -lt 1000000 ]; then
@@ -164,6 +166,10 @@ enable-ipv6=$ENABLE_IPV6
 language=$LANGUAGE
 EOF
   ok "server.properties criado"
+  if [ ! -f "$SERVER_DIR/pocketmine.yml" ]; then
+    printf 'auto-updater:\n  enabled: false\n' > "$SERVER_DIR/pocketmine.yml"
+    ok "pocketmine.yml criado (auto-updater desligado; atualize com ./pmmp update)"
+  fi
 }
 
 # O PHP da PMMP para Android é musl estático e lê DNS de /sdcard/resolv.conf (não de /etc).
@@ -180,6 +186,17 @@ ensure_php_dns() {
   fi
 }
 
+# O fork consulta update.betterlite.org se o auto-updater estiver ligado. Num pocketmine.yml já existente
+# (gerado por uma versão anterior) ele vem ligado por padrão, então desligamos aqui.
+disable_updater() {
+  local f="$SERVER_DIR/pocketmine.yml"
+  [ -f "$f" ] || return 0
+  if sed -n '/^auto-updater:/,/^[^ ]/p' "$f" | grep -q '^  enabled: *true'; then
+    sed -i '/^auto-updater:/,/^[^ ]/ s/^\(  enabled:\) *true/\1 false/' "$f"
+    ok "auto-updater desligado em pocketmine.yml (atualize com ./pmmp update)"
+  fi
+}
+
 cmd_setup() {
   require_arch
   need curl; need tar
@@ -187,6 +204,7 @@ cmd_setup() {
   install_php
   install_phar
   seed_properties
+  disable_updater
   ensure_php_dns
   if [ "$USE_PLAYIT" = "1" ]; then
     playit_install || warn "playit não instalado (é opcional) — o servidor funciona sem ele."
@@ -328,6 +346,7 @@ cmd_update() {
   if is_running; then was=1; cmd_stop; fi
   cmd_backup
   install_phar force
+  disable_updater
   [ "$with_php" -eq 1 ] && install_php force
   [ "$was" -eq 1 ] && cmd_start
   return 0

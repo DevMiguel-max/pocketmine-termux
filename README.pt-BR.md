@@ -2,9 +2,25 @@
 
 🇬🇧 [English](README.md) · 🇧🇷 **Português**
 
-Cria e roda um servidor **Minecraft Bedrock** (PocketMine-MP) no Termux com um comando. Usa os binários **oficiais** da PMMP (PHP Android arm64 + `PocketMine-MP.phar`), não o código-fonte.
+Cria e roda um servidor **Minecraft Bedrock** (PocketMine-MP) no Termux com um comando. Usa o PHP compilado pela PMMP (Android arm64) e um `PocketMine-MP.phar` pronto (de um fork da comunidade por padrão, veja abaixo), não o código-fonte.
 
 > Por que não clonar `pmmp/PocketMine-MP`? Rodar do fonte exige PHP com a extensão `pmmpthread`, que o PHP do Termux (`pkg install php`) não tem. O PHP oficial da PMMP já vem com tudo.
+
+## Sobre o fork (leia)
+
+A equipe da PMMP **encerrou o suporte em 2026-07-09** (anúncio no README do `pmmp/PocketMine-MP`). A última versão oficial, a 5.44.3, só suporta o Minecraft **v26.30**, e não haverá novas atualizações. Por isso um jogo atual não consegue entrar no servidor oficial.
+
+O `config.env` aponta `PM_REPO` por padrão para o fork da comunidade **`BetterLite/PocketMine-MP`**, cuja versão 5.50.0 anuncia a **v26.50** (as notas citam também a 26.52; o phar embutido reporta v26.50). Para voltar ao oficial: `PM_REPO="pmmp/PocketMine-MP"` (só funciona com o Minecraft 26.30).
+
+É um **software não oficial, de mantenedores que não conheço**, e o histórico do git foi achatado, então não dá para rastrear as mudanças commit a commit. O que eu verifiquei (análise estática, **não** é uma auditoria completa):
+- Contra o upstream 5.44.3: nenhum padrão novo de `exec`/`eval`/`base64`/chamada de rede no código alterado de `src/`. Os únicos domínios novos são as URLs de atualização/Discord/tradução do próprio fork no lugar das da PMMP.
+- O código do phar publicado bate com o código da tag, exceto por um erro de digitação corrigido.
+- As bibliotecas `betterlite/*` (protocolo, schemas de blocos/itens) têm os mesmos padrões suspeitos que as equivalentes do upstream, e as extensões PHP exigidas são idênticas.
+- As bibliotecas de terceiros que ele atualizou (brick/math, jsonmapper, ramsey/uuid, symfony/filesystem) são idênticas, byte a byte, às versões originais no GitHub. O phar não tem executáveis nem código empacotado/ofuscado, e a heurística de ofuscação dá os mesmos resultados do upstream.
+
+Não verifiquei: a leitura linha a linha dos ~130 arquivos alterados. O binário do PHP e as extensões continuam vindo dos builds da PMMP. O `./pmmp setup` e o `./pmmp update` **desligam** o atualizador interno no `pocketmine.yml` (ele consultaria o `update.betterlite.org`); atualize com `./pmmp update`.
+
+Existe outro fork em andamento (`phpMine-MP`) que não tinha nenhuma versão publicada quando olhei.
 
 ## Uso rápido
 
@@ -78,7 +94,7 @@ No log do playit, um único `Network unreachable` num endereço IPv6 e algumas l
 
 ## O que foi testado (e o que não)
 
-Em aarch64 emulado: download dos binários, extração, `pmmpthread`/`leveldb` carregados, o phar sobe com `--no-wizard` até `Done` em `0.0.0.0:19132`, start/stop/restart/cmd/backup, proteção contra crash-loop, fluxo de claim do playit.
+Em aarch64 emulado (inclusive o phar 5.50.0 do fork, que sobe até `Done` anunciando a v26.50): download dos binários, extração, `pmmpthread`/`leveldb` carregados, o phar sobe com `--no-wizard` até `Done` em `0.0.0.0:19132`, start/stop/restart/cmd/backup, proteção contra crash-loop, fluxo de claim do playit.
 
 Em celular real (confirmado pelo autor): instalação (depois de um upgrade completo do `apt`), servidor iniciando, daemon do playit rodando via `proot`, conectando e com o túnel carregado.
 
